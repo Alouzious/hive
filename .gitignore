@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# Vite build output
+frontend/dist/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
