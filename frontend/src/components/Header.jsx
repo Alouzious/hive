@@ -1,68 +1,72 @@
 import { useState, useEffect } from 'react'
 import { Wallet, Hexagon, ExternalLink, LogOut, Droplets, X, Download, Check, AlertCircle, Loader } from 'lucide-react'
 
-// Singleton kit instance — created once, reused across calls
+// Use package export subpaths so Vite can resolve under the package exports map.
+
 let kitInstance = null
-let kitInitPromise = null
+let kitInitialized = false
 
-async function getKit() {
-  if (kitInstance) return kitInstance
-  // Deduplicate concurrent init calls
-  if (kitInitPromise) return kitInitPromise
+async function initKit() {
+  if (kitInitialized && kitInstance) return kitInstance
+  try {
+    const { StellarWalletsKit, WalletNetwork } = await import('@creit-tech/stellar-wallets-kit/sdk')
+    const { FreighterModule }                  = await import('@creit-tech/stellar-wallets-kit/modules/freighter')
+    const { LobstrModule }                     = await import('@creit-tech/stellar-wallets-kit/modules/lobstr')
+    const { AlbedoModule }                     = await import('@creit-tech/stellar-wallets-kit/modules/albedo')
+    const { xBullModule }                      = await import('@creit-tech/stellar-wallets-kit/modules/xbull')
 
-  kitInitPromise = (async () => {
-    try {
-      const { StellarWalletsKit, WalletNetwork } =
-        await import('@creit-tech/stellar-wallets-kit')
-      const { defaultModules } =
-        await import('@creit-tech/stellar-wallets-kit/modules/utils')
-
-      kitInstance = new StellarWalletsKit({
-        network: WalletNetwork.TESTNET,
-        modules: defaultModules(),
-      })
-      return kitInstance
-    } catch (err) {
-      console.warn('Wallets Kit init failed:', err.message)
-      kitInitPromise = null   // allow retry on next call
-      return null
-    }
-  })()
-
-  return kitInitPromise
+    kitInstance = new StellarWalletsKit({
+      network: WalletNetwork.TESTNET,
+      selectedWalletId: 'freighter',
+      modules: [
+        new FreighterModule(),
+        new LobstrModule(),
+        new AlbedoModule(),
+        new xBullModule(),
+      ],
+    })
+    kitInitialized = true
+    return kitInstance
+  } catch (err) {
+    console.warn('Kit init failed:', err.message)
+    return null
+  }
 }
 
 async function connectWithKit(walletId) {
-  const kit = await getKit()
+  const kit = await initKit()
   if (!kit) throw new Error('Wallets Kit not available')
-
   kit.setWallet(walletId)
   const { address } = await kit.getAddress()
-  if (!address) throw new Error('No address returned from wallet.')
+  if (!address) throw new Error('No address returned')
   return address
 }
 
+// Wallet definitions with detection and connect logic
 const WALLETS = [
   {
     id:         'freighter',
     name:       'Freighter',
     desc:       'Most popular Stellar browser extension',
     installUrl: 'https://www.freighter.app',
-    checkFn:    () => typeof window !== 'undefined' && (!!window.freighter || !!window.freighterApi),
-    connectFn:  async () => {
-      // Try kit first; fall back to direct Freighter API if kit fails
+    checkFn:    () => {
+      return !!(
+        window?.freighter ||
+        window?.freighterApi ||
+        window?.stellar?.freighter
+      )
+    },
+    connectFn: async () => {
       try {
         return await connectWithKit('freighter')
       } catch (kitErr) {
-        console.warn('Kit connect failed, trying direct Freighter API:', kitErr.message)
-        const api = window.freighter || window.freighterApi
-        if (!api) throw new Error('Freighter not installed. Please install it and refresh.')
+        // Direct Freighter fallback
+        const api = window?.freighterApi || window?.freighter
+        if (!api) throw new Error('Freighter not detected. Please refresh the page.')
         const connected = await api.isConnected()
-        if (!connected) throw new Error('Freighter is locked. Please unlock it and try again.')
-        const result = await api.getPublicKey()
-        const addr = typeof result === 'string' ? result : result?.publicKey
-        if (!addr) throw new Error('Freighter did not return an address.')
-        return addr
+        if (!connected.isConnected) throw new Error('Please unlock your Freighter wallet.')
+        const result = await api.getAddress()
+        return result?.address || result
       }
     },
   },
@@ -71,14 +75,8 @@ const WALLETS = [
     name:       'LOBSTR',
     desc:       'Mobile and web Stellar wallet',
     installUrl: 'https://lobstr.co/join/',
-    checkFn:    () => typeof window !== 'undefined' && !!window.lobstrWallet,
-    connectFn:  async () => {
-      try {
-        return await connectWithKit('lobstr')
-      } catch {
-        throw new Error('LOBSTR wallet not detected. Please install and try again.')
-      }
-    },
+    checkFn:    () => !!(window?.lobstrWallet || window?.lobstr),
+    connectFn:  async () => connectWithKit('lobstr'),
   },
   {
     id:         'albedo',
@@ -87,29 +85,35 @@ const WALLETS = [
     installUrl: 'https://albedo.link',
     checkFn:    () => true,
     connectFn:  async () => {
-      return new Promise((resolve, reject) => {
-        const popup = window.open(
-          'https://albedo.link/intent/public-key?title=Hive',
-          'albedo_connect',
-          'width=540,height=720,left=200,top=100,resizable=yes,scrollbars=yes'
-        )
-        if (!popup) {
-          reject(new Error('Popup blocked. Please allow popups for this site and try again.'))
-          return
-        }
-        const handler = (event) => {
-          if (event.origin !== 'https://albedo.link') return
-          window.removeEventListener('message', handler)
-          if (event.data?.pubkey) resolve(event.data.pubkey)
-          else reject(new Error('Albedo connection was cancelled.'))
-        }
-        window.addEventListener('message', handler)
-        setTimeout(() => {
-          window.removeEventListener('message', handler)
-          reject(new Error('Albedo timed out. Please try again.'))
-        }, 120000)
-      })
+      try {
+        return await connectWithKit('albedo')
+      } catch {
+        return new Promise((resolve, reject) => {
+          const popup = window.open(
+            'https://albedo.link/intent/public-key?title=Hive',
+            'albedo_connect',
+            'width=540,height=720,left=200,top=100'
+          )
+          if (!popup) { reject(new Error('Popup blocked. Allow popups and try again.')); return }
+          const handler = (e) => {
+            if (e.origin !== 'https://albedo.link') return
+            window.removeEventListener('message', handler)
+            if (e.data?.pubkey) resolve(e.data.pubkey)
+            else reject(new Error('Albedo connection cancelled.'))
+          }
+          window.addEventListener('message', handler)
+          setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('Albedo timed out.')) }, 120000)
+        })
+      }
     },
+  },
+  {
+    id:         'xbull',
+    name:       'xBull',
+    desc:       'PWA and extension Stellar wallet',
+    installUrl: 'https://xbull.app',
+    checkFn:    () => !!(window?.xBullSDK),
+    connectFn:  async () => connectWithKit('xbull'),
   },
 ]
 
@@ -120,14 +124,12 @@ export default function Header({ walletAddress, setWalletAddress }) {
   const [error,        setError]        = useState(null)
   const [checked,      setChecked]      = useState(false)
 
-  useEffect(() => {
-    // Pre-init the kit on page load to avoid cold-start delay
-    getKit()
-  }, [])
+  // Pre-init kit on page load
+  useEffect(() => { initKit() }, [])
 
+  // Detect wallets when modal opens — wait 600ms for extensions to inject
   useEffect(() => {
     if (showModal && !checked) {
-      // Give extensions 400ms to inject into window
       setTimeout(() => {
         const states = {}
         WALLETS.forEach(w => {
@@ -136,7 +138,7 @@ export default function Header({ walletAddress, setWalletAddress }) {
         })
         setWalletStates(states)
         setChecked(true)
-      }, 400)
+      }, 600)
     }
     if (!showModal) setChecked(false)
   }, [showModal])
@@ -146,19 +148,17 @@ export default function Header({ walletAddress, setWalletAddress }) {
     setError(null)
     try {
       const address = await wallet.connectFn()
-      if (!address) throw new Error('No address returned from wallet.')
       setWalletAddress(address)
       setShowModal(false)
     } catch (err) {
-      console.error('Wallet connect error:', err)
       const msg = err.message || 'Connection failed.'
-      if (msg.includes('not found') || msg.includes('not installed') || msg.includes('not detected')) {
-        setError(msg)
-      } else if (msg.includes('declined') || msg.includes('rejected') || msg.includes('cancelled')) {
+      if (msg.includes('not detected') || msg.includes('not found') || msg.includes('not installed')) {
+        setError(msg + ' Please install it, refresh the page, and try again.')
+      } else if (msg.includes('declined') || msg.includes('rejected') || msg.includes('cancelled') || msg.includes('User')) {
         setError('Connection rejected. Please approve in your wallet and try again.')
       } else if (msg.includes('unlock') || msg.includes('locked')) {
         setError('Please unlock your wallet first, then try again.')
-      } else if (msg.includes('Popup blocked')) {
+      } else if (msg.includes('Popup')) {
         setError('Popup blocked. Please allow popups for this site.')
       } else {
         setError(msg)
@@ -168,15 +168,12 @@ export default function Header({ walletAddress, setWalletAddress }) {
     }
   }
 
-  function openModal()  { setError(null); setShowModal(true)  }
-  function closeModal() { setError(null); setShowModal(false) }
-
   function truncate(addr) {
     if (!addr) return ''
     return addr.slice(0, 6) + '...' + addr.slice(-4)
   }
 
-  function walletInstalled(wallet) {
+  const isInstalled = (wallet) => {
     if (!checked) return null
     return walletStates[wallet.id] === true
   }
@@ -208,7 +205,6 @@ export default function Header({ walletAddress, setWalletAddress }) {
       <header className="sticky top-0 z-40 border-b backdrop-blur-md"
         style={{ background: 'rgba(2,8,23,0.92)', borderColor: 'var(--border)' }}>
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg flex items-center justify-center"
               style={{ background: 'rgba(56,189,248,0.15)', border: '1px solid rgba(56,189,248,0.3)' }}>
@@ -249,7 +245,7 @@ export default function Header({ walletAddress, setWalletAddress }) {
               </button>
             </div>
           ) : (
-            <button onClick={openModal}
+            <button onClick={() => { setError(null); setShowModal(true) }}
               className="flex items-center gap-2 px-4 py-2 rounded-lg mono text-xs font-bold transition-all hover:scale-105 active:scale-95"
               style={{ background: 'linear-gradient(135deg, rgba(56,189,248,0.2), rgba(129,140,248,0.15))', border: '1px solid rgba(56,189,248,0.35)', color: 'var(--accent)' }}>
               <Wallet size={14} /> CONNECT WALLET
@@ -262,13 +258,13 @@ export default function Header({ walletAddress, setWalletAddress }) {
       {showModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
           style={{ background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }}
-          onClick={(e) => { if (e.target === e.currentTarget) closeModal() }}>
+          onClick={(e) => { if (e.target === e.currentTarget) { setShowModal(false); setError(null) } }}>
           <div className="w-full max-w-md rounded-2xl p-6 animate-slide-up"
             style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', boxShadow: '0 0 80px rgba(56,189,248,0.08)' }}>
 
             <div className="flex items-center justify-between mb-1">
               <h2 className="font-bold text-base">Connect a Wallet</h2>
-              <button onClick={closeModal}
+              <button onClick={() => { setShowModal(false); setError(null) }}
                 className="p-1.5 rounded-lg transition-colors hover:text-white"
                 style={{ color: 'var(--text-muted)', border: '1px solid var(--border)' }}>
                 <X size={14} />
@@ -287,7 +283,7 @@ export default function Header({ walletAddress, setWalletAddress }) {
             )}
 
             {!checked && (
-              <div className="flex items-center justify-center gap-2 py-6 mono text-xs" style={{ color: 'var(--text-muted)' }}>
+              <div className="flex items-center justify-center gap-2 py-8 mono text-xs" style={{ color: 'var(--text-muted)' }}>
                 <Loader size={14} className="animate-spin" />
                 Detecting installed wallets...
               </div>
@@ -296,7 +292,7 @@ export default function Header({ walletAddress, setWalletAddress }) {
             {checked && (
               <div className="flex flex-col gap-2">
                 {WALLETS.map(wallet => {
-                  const installed    = walletInstalled(wallet)
+                  const installed    = isInstalled(wallet)
                   const isConnecting = connecting === wallet.id
                   const available    = installed || wallet.id === 'albedo'
 
@@ -318,7 +314,7 @@ export default function Header({ walletAddress, setWalletAddress }) {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
                               <span className="font-semibold text-sm">{wallet.name}</span>
-                              {wallet.id !== 'albedo' && (
+                              {wallet.id !== 'albedo' && installed && (
                                 <span className="mono text-xs px-1.5 py-0.5 rounded flex items-center gap-1"
                                   style={{ background: 'rgba(52,211,153,0.1)', color: 'var(--green)', border: '1px solid rgba(52,211,153,0.2)' }}>
                                   <Check size={9} /> Detected
